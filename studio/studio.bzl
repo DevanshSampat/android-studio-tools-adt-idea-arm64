@@ -1,0 +1,1961 @@
+"""This file contains Bazel build rules for the Android Studio release distribution"""
+
+load("@rules_java//java:defs.bzl", "java_binary")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+load("//build/bazel/rules/gathering:prebuilt_package_metadata.bzl", "prebuilt_package_metadata")
+load("//build/bazel/rules/gathering:write_package_metadata.bzl", "write_package_metadata")
+load("//tools/adt/idea/studio/rules:app-icon.bzl", "AppIconInfo", "replace_app_icon")
+load("//tools/base/bazel:bazel.bzl", "ImlModuleInfo")
+load("//tools/base/bazel:expand_template.bzl", "expand_template_ex")
+load("//tools/base/bazel:functions.bzl", "create_option_file")
+load("//tools/base/bazel:jvm_import.bzl", "jvm_import")
+load("//tools/base/bazel:merge_archives.bzl", "run_singlejar")
+load("//tools/base/bazel:utils.bzl", "dir_archive", "endswith_glob", "is_release")
+
+PluginInfo = provider(
+    doc = "Info for IntelliJ plugins, including those built by the studio_plugin rule",
+    fields = {
+        "directory": "where to place this plugin within the plugins directory",
+        "plugin_metadata": "metadata produced by the check_plugin tool",
+        "modules": "ImlModuleInfo for modules included in this plugin",
+        "libs": "libraries to be included in this plugin",
+        "license_files": "",
+        "plugin_files": "A map from the final studio location to the file it goes there.",
+        "overwrite_plugin_version": "whether to stamp version metadata into plugin.xml",
+        "platform": "The platform this plugin was compiled against",
+        "plugin_id": "The plugin id",
+    },
+)
+
+IntellijInfo = provider(
+    doc = "Info about the IntelliJ SDK provided by the intellij_platform rule",
+    fields = {
+        "major_version": "The major IntelliJ version",
+        "minor_version": "The minor IntelliJ version",
+        "base": "A map from final studio location to the file (all non plugin files)",
+        "plugins": "The file maps for all the bundled plugins",
+    },
+)
+
+StudioDataInfo = provider(
+    doc = "Holds IDE distribution files split by platform",
+    fields = {
+        "linux": "Linux files",
+        "mac": "Mac x86-64 files",
+        "mac_arm": "Mac aarch64 files",
+        "win": "Windows files",
+        "mappings": "A map from files to destination paths",
+    },
+)
+
+_ConfigurationInfo = provider(
+    doc = "All the needed information to configure a studio distro (channel, flags, icons, splash screen, etc)",
+    fields = {
+        "version_type": "Nightly, Canary, Beta, etc.",
+        "version_suffix": "If None, auto computed, if provided used instead. Eg. Nightly 2024-10-10.",
+        "application_icon": "The application icon to use.",
+        "mac_app_name": "The application name on Mac, e.g. 'Android Studio Preview'",
+        "vm_options": "Custom vm options per configuration",
+        "properties": "Custom properties per configuration",
+    },
+)
+
+_SearchableOptionsInfo = provider(
+    # For context: the "searchable options" for a given plugin is essentially just a list of
+    # available options exposed by that plugin in the IDE settings dialog. The list gets stored
+    # in a file which the IDE parses at runtime to optimize search queries from the user.
+    doc = "Holds searchable options generated for a given set of plugins",
+    fields = {
+        "so_jars": "A map from plugin IDs to corresponding searchable options jars",
+    },
+)
+
+# Valid types (and their corresponding channels) which can be specified
+# by the android_studio rule.
+type_channel_mappings = {
+    "Nightly": "Dev",
+    "Canary": "Canary",
+    "Beta": "Beta",
+    "RC": "Beta",
+    "Stable": "Stable",
+}
+
+def _lnzipper_resources(_os, _num_inputs):
+    return {"cpu": 16, "memory": 4096}
+
+def _zipper(ctx, desc, map, out, deps = []):
+    files = [f for (p, f) in map if f]
+    zipper_files = [r + "=" + (f.path if f else "") + "\n" for r, f in map]
+    zipper_args = ["cC" if ctx.attr.compress else "c", out.path]
+    zipper_list = create_option_file(ctx, out.basename + ".res.lst", "".join(zipper_files))
+    zipper_args.append("@" + zipper_list.path)
+    ctx.actions.run(
+        inputs = files + [zipper_list] + deps,
+        outputs = [out],
+        executable = ctx.executable._zipper,
+        arguments = zipper_args,
+        progress_message = "Creating %s zip..." % desc,
+        mnemonic = "zipper",
+    )
+
+def _lnzipper(ctx, desc, filemap, out, attrs = {}, deps = []):
+    """Creates a ZIP out while preserving symlinks."""
+    files = []
+    fileargs = []
+    for zip_path, f in filemap:
+        files.append(f)
+        attr = ("[" + attrs[zip_path] + "]") if zip_path in attrs else ""
+        fileargs.append("%s%s=%s\n" % (zip_path, attr, f.path if f else ""))
+
+    lnzipper_options = "-c"
+    if ctx.attr.compress:
+        lnzipper_options += "C"
+
+    args = [lnzipper_options, out.path]
+    argfile = create_option_file(ctx, out.basename + ".res.lst", "".join(fileargs))
+    args.append("@" + argfile.path)
+    ctx.actions.run(
+        inputs = files + [argfile] + deps,
+        outputs = [out],
+        executable = ctx.executable._lnzipper,
+        resource_set = _lnzipper_resources,
+        arguments = args,
+        progress_message = "lnzipping %s" % desc,
+        mnemonic = "lnzipper",
+    )
+
+# Bazel does not support attributes of type 'dict of string -> list of labels',
+# and in order to support them we must 'unpack' the dictionary to two lists
+# of keys and value. The following two functions perform the mapping back and forth
+def _dict_to_lists(dict):
+    keys = []
+    values = []
+    for k, vs in dict.items():
+        keys += [k] * len(vs)
+        values += vs
+    return keys, values
+
+def _lists_to_dict(keys, values):
+    dict = {}
+    for k, v in zip(keys, values):
+        if k not in dict:
+            dict[k] = []
+        dict[k].append(v)
+    return dict
+
+def _pack_modules(ctx, jar_names, modules):
+    jars = _lists_to_dict(jar_names, modules)
+    res_files = []
+    for j, ms in jars.items():
+        jar_file = ctx.actions.declare_file(j)
+        modules_jars = [m[ImlModuleInfo].module_jars for m in ms]
+        run_singlejar(ctx, modules_jars, jar_file)
+        res_files.append((j, jar_file))
+    return res_files
+
+def _get_linux(x):
+    return x.linux
+
+LINUX = struct(
+    name = "linux",
+    jre = "jbr/",
+    get = _get_linux,
+    base_path = "",
+    resource_path = "",
+)
+
+def _get_mac(x):
+    return x.mac
+
+MAC = struct(
+    name = "mac",
+    jre = "jbr/",
+    get = _get_mac,
+    base_path = "Contents/",
+    resource_path = "Contents/Resources/",
+)
+
+def _get_mac_arm(x):
+    return x.mac_arm
+
+MAC_ARM = struct(
+    name = "mac_arm",
+    jre = "jbr/",
+    get = _get_mac_arm,
+    base_path = "Contents/",
+    resource_path = "Contents/Resources/",
+)
+
+def _get_win(x):
+    return x.win
+
+WIN = struct(
+    name = "win",
+    jre = "jbr/",
+    get = _get_win,
+    base_path = "",
+    resource_path = "",
+)
+
+def _resource_deps(res_dirs, res, platform):
+    files = []
+    for dir, dep in zip(res_dirs, res):
+        if StudioDataInfo in dep:
+            dep_data = dep[StudioDataInfo]
+            files += [(dir + "/" + dep_data.mappings[f], f) for f in platform.get(dep_data).to_list()]
+        else:
+            files += [(dir + "/" + f.basename, f) for f in dep.files.to_list()]
+    return files
+
+def _check_plugin(ctx, out, files, kind, id, allow_bundled_updates = False, verify_deps = None):
+    deps = None
+    if verify_deps != None:
+        deps = [dep[PluginInfo].plugin_metadata for dep in verify_deps]
+
+    check_args = ctx.actions.args()
+    check_args.add("--out", out)
+    check_args.add_all("--files", files)
+    check_args.add("--kind", kind)
+    check_args.add("--id", id)
+    if allow_bundled_updates:
+        check_args.add("--allow_bundled_updates")
+    if deps != None:
+        check_args.add_all("--deps", deps, omit_if_empty = False)
+
+    ctx.actions.run(
+        inputs = files + (deps if deps else []),
+        outputs = [out],
+        executable = ctx.executable._check_plugin,
+        arguments = [check_args],
+        progress_message = "Analyzing %s plugin..." % ctx.attr.name,
+        mnemonic = "chkplugin",
+    )
+
+def _studio_plugin_os(ctx, platform, plugin_jars, plugin_dir):
+    files = {plugin_dir + "/lib/" + d: f for (d, f) in plugin_jars}
+
+    res = _resource_deps(ctx.attr.resources_dirs, ctx.attr.resources, platform)
+    files.update({plugin_dir + "/" + d: f for (d, f) in res})
+
+    return files
+
+def _depset_subtract(depset1, depset2):
+    # Use label here so that aliases are treated the same as their actuals.
+    dict1 = {e1.label: None for e1 in depset1.to_list()}
+    return [e2 for e2 in depset2.to_list() if e2.label not in dict1]
+
+def _label_str(label):
+    if label.workspace_name:
+        return str(label)
+    else:
+        return "//%s:%s" % (label.package, label.name)
+
+def _studio_plugin_impl(ctx):
+    plugin_id = ctx.attr.name
+    plugin_dir = "plugins/" + ctx.attr.directory
+    plugin_jars = _pack_modules(ctx, ctx.attr.jars, ctx.attr.modules)
+    plugin_jars = plugin_jars + [(f.basename, f) for f in ctx.files.libs]
+
+    # Ensure plugin id is known at build time
+    _check_plugin(
+        ctx,
+        ctx.outputs.plugin_metadata,
+        [f for (r, f) in plugin_jars],
+        "plugin",
+        ctx.attr.name,
+        verify_deps = ctx.attr.deps,
+    )
+    plugin_files_linux = _studio_plugin_os(ctx, LINUX, plugin_jars, plugin_dir)
+    plugin_files_mac = _studio_plugin_os(ctx, MAC, plugin_jars, plugin_dir)
+    plugin_files_mac_arm = _studio_plugin_os(ctx, MAC_ARM, plugin_jars, plugin_dir)
+    plugin_files_win = _studio_plugin_os(ctx, WIN, plugin_jars, plugin_dir)
+
+    for lib in ctx.attr.libs:
+        if ImlModuleInfo in lib:
+            fail(lib.label.name + " is a module, yet it is listed under libs")
+        if PluginInfo in lib:
+            fail("Plugin dependencies should be in the deps attribute, not in libs")
+
+    # Check that all modules needed by the modules in this plugin, are either present in the
+    # plugin or in its dependencies.
+    need = depset(transitive = [depset(m[ImlModuleInfo].deps) for m in ctx.attr.modules])
+    have = depset(
+        direct = ctx.attr.modules + ctx.attr.libs + [ctx.attr._intellij_sdk],
+        transitive = [d[PluginInfo].modules for d in ctx.attr.deps] +
+                     [d[PluginInfo].libs for d in ctx.attr.deps] +
+                     [depset(ctx.attr.deps)],
+    )
+
+    missing = [s.label for s in _depset_subtract(have, need)]
+    if missing:
+        error = "\n".join(["\"%s\"," % _label_str(label) for label in missing])
+        fail("Plugin '" + ctx.attr.name + "' has compile-time dependencies which are not on the " +
+             "runtime classpath in release builds.\nYou may need to edit the plugin definition at " +
+             str(ctx.label) + " to include the following dependencies:\n" + error)
+    return [
+        PluginInfo(
+            directory = ctx.attr.directory,
+            plugin_files = struct(
+                linux = plugin_files_linux,
+                mac = plugin_files_mac,
+                mac_arm = plugin_files_mac_arm,
+                win = plugin_files_win,
+            ),
+            plugin_metadata = ctx.outputs.plugin_metadata,
+            modules = depset(ctx.attr.modules),
+            libs = depset(ctx.attr.libs),
+            license_files = depset(ctx.files.license_files),
+            overwrite_plugin_version = True,
+            platform = ctx.attr._intellij_platform,
+            plugin_id = plugin_id,
+        ),
+        # Force 'chkplugin' to run by marking its output as a validation output.
+        # See https://bazel.build/extending/rules#validation_actions for details.
+        OutputGroupInfo(_validation = depset([ctx.outputs.plugin_metadata])),
+    ]
+
+_studio_plugin = rule(
+    attrs = {
+        "modules": attr.label_list(providers = [ImlModuleInfo], allow_empty = True),
+        "libs": attr.label_list(allow_files = True),
+        "license_files": attr.label_list(allow_files = True),
+        "jars": attr.string_list(),
+        "resources": attr.label_list(allow_files = True),
+        "resources_dirs": attr.string_list(),
+        "directory": attr.string(),
+        "compress": attr.bool(),
+        "deps": attr.label_list(providers = [PluginInfo]),
+        "_singlejar": attr.label(
+            default = Label("@bazel_tools//tools/jdk:singlejar"),
+            cfg = "exec",
+            executable = True,
+        ),
+        "_zipper": attr.label(
+            default = Label("@bazel_tools//tools/zip:zipper"),
+            cfg = "exec",
+            executable = True,
+        ),
+        "_check_plugin": attr.label(
+            default = Label("//tools/adt/idea/studio:check_plugin"),
+            cfg = "exec",
+            executable = True,
+        ),
+        "_intellij_platform": attr.label(
+            default = Label("//tools/base/intellij-bazel:intellij_platform"),
+            cfg = "exec",
+        ),
+        "_intellij_sdk": attr.label(
+            default = Label("@intellij//:intellij-sdk"),
+        ),
+    },
+    outputs = {
+        "plugin_metadata": "%{name}.info",
+    },
+    implementation = _studio_plugin_impl,
+)
+
+def _searchable_options_impl(ctx):
+    searchable_options = {}
+    for dep in ctx.attr.deps:
+        searchable_options.update(dep[_SearchableOptionsInfo].so_jars)
+    searchable_options_src = {}
+    for dep, plugin in ctx.attr.searchable_options.items():
+        if plugin not in searchable_options_src:
+            so_jar = ctx.actions.declare_file(ctx.attr.name + ".%s.so.jar" % plugin)
+            searchable_options_src[plugin] = []
+            searchable_options[plugin] = so_jar
+        searchable_options_src[plugin].extend(dep[DefaultInfo].files.to_list())
+
+    for id, srcs in searchable_options_src.items():
+        jar = searchable_options[id]
+        _zipper(ctx, "%s %s searchable options" % (id, jar), [(f.basename, f) for f in srcs], jar)
+
+    return [
+        DefaultInfo(files = depset(searchable_options.values())),
+        _SearchableOptionsInfo(so_jars = searchable_options),
+    ]
+
+_searchable_options = rule(
+    attrs = {
+        "searchable_options": attr.label_keyed_string_dict(allow_files = True),
+        "deps": attr.label_list(
+            default = [],
+            providers = [_SearchableOptionsInfo],
+        ),
+        "compress": attr.bool(),
+        "strip_prefix": attr.string(),
+        "_zipper": attr.label(
+            default = Label("@bazel_tools//tools/zip:zipper"),
+            cfg = "exec",
+            executable = True,
+        ),
+    },
+    executable = False,
+    provides = [_SearchableOptionsInfo],
+    implementation = _searchable_options_impl,
+)
+
+def searchable_options(name, files, deps = [], **kwargs):
+    _searchable_options(
+        name = name,
+        compress = is_release(),
+        searchable_options = files,
+        deps = deps,
+        **kwargs
+    )
+
+# Build an Android Studio plugin.
+# This plugin is a zip file with the final layout inside Android Studio plugin's directory.
+# Args
+#    name: The id of the plugin (eg. intellij.android.plugin)
+#    directory: The directory to use inside plugins (eg. android)
+#    modules: A dictionary of the form
+#             {"name.jar": ["m1" , "m2"]}
+#             Where keys are the names of the jars in the libs directory, and the values
+#             are the list of modules that will be in that jar.
+#    resources: A dictionary of the form
+#             {"dir": <files> }
+#             where keys are the directories where to place the resources, and values
+#             is a list of files to place there (it supports studio_data rules)
+def studio_plugin(
+        name,
+        directory,
+        modules = {},
+        resources = {},
+        **kwargs):
+    jars, modules_list = _dict_to_lists(modules)
+    resources_dirs, resources_list = _dict_to_lists(resources)
+
+    _studio_plugin(
+        name = name,
+        directory = directory,
+        modules = modules_list,
+        jars = jars,
+        resources = resources_list,
+        resources_dirs = resources_dirs,
+        compress = is_release(),
+        **kwargs
+    )
+
+def _studio_data_impl(ctx):
+    for dep in ctx.attr.files_linux + ctx.attr.files_mac + ctx.attr.files_mac_arm + ctx.attr.files_win:
+        if StudioDataInfo in dep:
+            fail("studio_data does not belong on a platform specific attribute, please add " + str(dep.label) + " to \"files\" directly")
+
+    files = []
+    mac = []
+    mac_arm = []
+    win = []
+    linux = []
+    mappings = {}
+    for dep in ctx.attr.files:
+        if StudioDataInfo in dep:
+            dep_data = dep[StudioDataInfo]
+            linux.append(dep_data.linux)
+            mac.append(dep_data.mac)
+            mac_arm.append(dep_data.mac_arm)
+            win.append(dep_data.win)
+            mappings.update(dep_data.mappings)
+        else:
+            files += dep[DefaultInfo].files.to_list()
+
+    for prefix, destination in ctx.attr.mappings.items():
+        for src in files + ctx.files.files_mac + ctx.files.files_mac_arm + ctx.files.files_linux + ctx.files.files_win:
+            if src not in mappings and src.short_path.startswith(prefix):
+                mappings[src] = destination + src.short_path[len(prefix):]
+
+    dlinux = depset(files + ctx.files.files_linux, order = "preorder", transitive = linux)
+    dmac = depset(files + ctx.files.files_mac, order = "preorder", transitive = mac)
+    dmac_arm = depset(files + ctx.files.files_mac_arm, order = "preorder", transitive = mac_arm)
+    dwin = depset(files + ctx.files.files_win, order = "preorder", transitive = win)
+
+    return [
+        StudioDataInfo(
+            linux = dlinux,
+            mac = dmac,
+            mac_arm = dmac_arm,
+            win = dwin,
+            mappings = mappings,
+        ),
+        DefaultInfo(files = depset(files)),
+    ]
+
+_studio_data = rule(
+    attrs = {
+        "files": attr.label_list(allow_files = True),
+        "files_linux": attr.label_list(allow_files = True),
+        "files_mac": attr.label_list(allow_files = True),
+        "files_mac_arm": attr.label_list(allow_files = True),
+        "files_win": attr.label_list(allow_files = True),
+        "mappings": attr.string_dict(mandatory = True),
+    },
+    executable = False,
+    provides = [StudioDataInfo],
+    implementation = _studio_data_impl,
+)
+
+# A specialized version of a filegroup, that groups all the given files but also provides different
+# sets of files for each platform.
+# This allows grouping all files of the same concept that have different platform variants.
+# Args:
+#     files: A list of files present on all platforms
+#     files_{linux, mac, mac_arm, win}: A list of files for each platform
+#     mapping: A dictionary to map file locations and build an arbitrary file tree, in the form of
+#              a dictionary from current directory to new directory.
+def studio_data(name, files = [], files_linux = [], files_mac = [], files_mac_arm = [], files_win = [], mappings = {}, tags = [], **kwargs):
+    _studio_data(
+        name = name,
+        files = files,
+        files_linux = files_linux,
+        files_mac = files_mac,
+        files_mac_arm = files_mac_arm,
+        files_win = files_win,
+        mappings = mappings,
+        tags = tags,
+        **kwargs
+    )
+
+def _studio_data_files_impl(ctx):
+    host_platform = platform_by_name[ctx.attr.host_platform_name]
+    data = ctx.attr.data[StudioDataInfo]
+    return [DefaultInfo(files = host_platform.get(data))]
+
+_studio_data_files = rule(
+    attrs = {
+        "data": attr.label(mandatory = True, providers = [StudioDataInfo]),
+        "host_platform_name": attr.string(mandatory = True),
+    },
+    executable = False,
+    implementation = _studio_data_files_impl,
+)
+
+# Converts a studio_data target into a filegroup for consumption by rules such as pkg_files.
+# It uses the current platform to return the correct set of files for pkg_files.
+# Args:
+#     name: The name of the filegroup
+#     data: The studio_data target
+def studio_data_files(
+        name,
+        data):
+    _studio_data_files(
+        name = name,
+        host_platform_name = select({
+            "@platforms//os:linux": LINUX.name,
+            "//tools/base/bazel/platforms:macos-x86_64": MAC.name,
+            "//tools/base/bazel/platforms:macos-arm64": MAC_ARM.name,
+            "@platforms//os:windows": WIN.name,
+        }),
+        data = data,
+    )
+
+def _split_version(version):
+    """Splits a version string into its constituent parts."""
+    index_of_period = version.find(".")
+    if index_of_period == -1:
+        fail('Cannot split version "%s" because no "." was found in it' % version)
+
+    micro = version[0:index_of_period]
+    patch = version[index_of_period + 1:]
+    return (micro, patch)
+
+def _get_channel_info(version_type):
+    """Maps a version type to information about a channel."""
+    if version_type not in type_channel_mappings:
+        fail('Invalid type "%s"; must be one of %s' % (version_type, str(type_channel_mappings.keys())))
+    return type_channel_mappings[version_type]
+
+def _form_version_full(ctx):
+    """Forms version_full based on code name, version type, and release number"""
+    code_name_and_patch_components = (ctx.attr.version_code_name +
+                                      " | " +
+                                      "{0}.{1}.{2}")
+    patch_name = _form_patch_name(ctx)
+    patch_name_suffix = " " + patch_name if patch_name else ""
+    return code_name_and_patch_components + patch_name_suffix
+
+def _form_patch_name(ctx):
+    """E.g., Canary 4, RC 1, Patch 1, Nightly 2025-01-01"""
+    config = ctx.attr.configuration[_ConfigurationInfo]
+    channel = _get_channel_info(config.version_type)
+    if channel == "Stable":
+        if ctx.attr.version_release_number <= 1:
+            return ""
+        return "Patch " + str(ctx.attr.version_release_number - 1)
+    if config.version_suffix:
+        return config.version_suffix
+    return config.version_type + " " + str(ctx.attr.version_release_number)
+
+def _form_studio_version_component(intellij_info, studio_micro):
+    """Returns the 4th component of the full 5-component build number, identifying a specific Studio release"""
+    return intellij_info.major_version[2:] + intellij_info.minor_version + studio_micro
+
+def _full_display_version(ctx):
+    """Returns the output of _form_version_full with versions applied."""
+    intellij_info = ctx.attr.platform[IntellijInfo]
+    (micro, _) = _split_version(ctx.attr.version_micro_patch)
+    return _form_version_full(ctx).format(intellij_info.major_version, intellij_info.minor_version, micro)
+
+def _append(ctx, platform, files, path, lines):
+    if not lines:
+        return
+    file = files[path]
+    text = "\n".join(lines)
+    template = ctx.actions.declare_file(ctx.attr.name + "." + file.basename + ".%s.template" % platform.name)
+    out = ctx.actions.declare_file(ctx.attr.name + "." + file.basename + ".%s.append.%s" % (platform.name, file.extension))
+    files[path] = out
+    ctx.actions.write(output = template, content = "{CONTENT}")
+    expand_template_ex(
+        ctx = ctx,
+        template = template,
+        out = out,
+        substitutions = {
+            "{CONTENT}": "$(inline " + file.path + ")\n" + text + "\n",
+        },
+        files = [file],
+    )
+
+def _stamp(ctx, args, srcs, src, out):
+    args.add("--stamp")
+    args.add(src)
+    args.add(out)
+    ctx.actions.run(
+        inputs = srcs + [src],
+        outputs = [out],
+        executable = ctx.executable._stamper,
+        arguments = [args],
+        progress_message = "Stamping %s" % src.basename,
+        mnemonic = "stamper",
+    )
+
+def _stamp_exe(ctx, extra, srcs, src, out):
+    args = ctx.actions.args()
+    args.add(src)
+    args.add(out)
+    ctx.actions.run(
+        inputs = srcs + [src],
+        outputs = [out],
+        executable = ctx.executable._patch_exe,
+        arguments = [args, extra],
+        progress_message = "Patching exe %s" % src.basename,
+        mnemonic = "patchexe",
+    )
+
+def _declare_stamped_file(ctx, files, platform, path):
+    original = files[path]
+    stamped = ctx.actions.declare_file(ctx.attr.name + "." + original.basename + ".%s.stamped.%s" % (platform.name, original.extension))
+    files[path] = stamped
+    return original, stamped
+
+def _produce_manifest(ctx, platform, platform_files):
+    out = ctx.outputs.manifest
+    config = ctx.attr.configuration[_ConfigurationInfo]
+    build_txt = platform_files[platform.resource_path + "build.txt"]
+    resources_jar = platform_files[platform.base_path + "lib/resources.jar"]
+
+    channel = _get_channel_info(config.version_type)
+    args = ["--out", out.path]
+    args += ["--build_txt", build_txt.path]
+    args += ["--resources_jar", resources_jar.path]
+    args += ["--channel", channel]
+    args += ["--code_name", ctx.attr.version_code_name]
+    args += ["--patch_name", _form_patch_name(ctx)]
+
+    ctx.actions.run(
+        inputs = [build_txt, resources_jar, ctx.info_file, ctx.version_file],
+        outputs = [out],
+        executable = ctx.executable._generate_build_metadata,
+        arguments = args,
+        progress_message = "Producing manifest for %s..." % ctx.attr.name,
+        mnemonic = "stamper",
+    )
+
+def _produce_update_message_html(ctx):
+    config = ctx.attr.configuration[_ConfigurationInfo]
+    if not ctx.file.update_message_template:
+        ctx.actions.write(output = ctx.outputs.update_message, content = "")
+        return
+
+    channel = _get_channel_info(config.version_type)
+
+    args = ctx.actions.args()
+    args.add("--version_file", ctx.version_file)
+    args.add_all(["--substitute", "{full_version}", _full_display_version(ctx)])
+    args.add_all(["--substitute", "{channel}", channel])
+    args.add("--replace_build_day")
+    _stamp(ctx, args, [ctx.version_file], ctx.file.update_message_template, ctx.outputs.update_message)
+
+def _stamp_platform(ctx, platform, platform_files, added_plugins):
+    config = ctx.attr.configuration[_ConfigurationInfo]
+
+    args = ["--stamp_platform"]
+
+    ret = {}
+    ret.update(platform_files)
+
+    (micro, patch) = _split_version(ctx.attr.version_micro_patch)
+    version_component = _form_studio_version_component(ctx.attr.platform[IntellijInfo], micro)
+
+    build_txt, stamped_build_txt = _declare_stamped_file(ctx, ret, platform, platform.resource_path + "build.txt")
+    args = ctx.actions.args()
+    args.add("--info_file", ctx.info_file)
+    args.add("--version_component", version_component)
+    args.add("--replace_build_number")
+    _stamp(ctx, args, [ctx.info_file], build_txt, stamped_build_txt)
+
+    resources_jar, stamped_resources_jar = _declare_stamped_file(ctx, ret, platform, platform.base_path + "lib/resources.jar")
+    args = ctx.actions.args()
+    args.add("--entry", "idea/AndroidStudioApplicationInfo.xml")
+    args.add("--version_file", ctx.version_file)
+    args.add("--version_full", _form_version_full(ctx))
+    args.add("--version_micro", micro)
+    args.add("--version_patch", patch)
+    args.add("--replace_build_day")
+    args.add("--build_txt", stamped_build_txt.path)
+
+    if ctx.attr.essential_plugins:
+        args.add_all("--essential_plugins", ctx.attr.essential_plugins)
+
+    args.add("--stamp_app_info")
+    _stamp(ctx, args, [ctx.version_file, stamped_build_txt], resources_jar, stamped_resources_jar)
+
+    idea_properties, stamped_idea_properties = _declare_stamped_file(ctx, ret, platform, platform.base_path + "bin/idea.properties")
+    args = ctx.actions.args()
+
+    system_selector = ctx.attr.selector + ctx.attr.platform[IntellijInfo].major_version + "." + ctx.attr.platform[IntellijInfo].minor_version + "." + micro
+
+    args.add("--replace_selector", system_selector)
+    _stamp(ctx, args, [], idea_properties, stamped_idea_properties)
+
+    if platform == LINUX:
+        studio_sh, stamped_studio_sh = _declare_stamped_file(ctx, ret, platform, platform.base_path + "bin/studio.sh")
+        args = ctx.actions.args()
+        args.add("--replace_selector", system_selector)
+        _stamp(ctx, args, [], studio_sh, stamped_studio_sh)
+
+        game_tools_sh, stamped_game_tools_sh = _declare_stamped_file(ctx, ret, platform, platform.base_path + "bin/game-tools.sh")
+        args = ctx.actions.args()
+        args.add("--replace_selector", system_selector)
+        _stamp(ctx, args, [], game_tools_sh, stamped_game_tools_sh)
+
+        install_txt, stamped_install_txt = _declare_stamped_file(ctx, ret, platform, platform.base_path + "Install-Linux-tar.txt")
+        args = ctx.actions.args()
+        args.add("--replace_selector", system_selector)
+        _stamp(ctx, args, [], install_txt, stamped_install_txt)
+
+    if platform == MAC or platform == MAC_ARM:
+        info_plist, stamped_info_plist = _declare_stamped_file(ctx, ret, platform, platform.base_path + "Info.plist")
+        args = ctx.actions.args()
+        args.add("--info_file", ctx.info_file)
+        args.add("--version_component", version_component)
+        args.add("--replace_build_number")
+        args.add("--replace_selector", system_selector)
+        _stamp(ctx, args, [ctx.info_file], info_plist, stamped_info_plist)
+
+    if platform == WIN:
+        studio_exe, stamped_studio_exe = _declare_stamped_file(ctx, ret, platform, platform.base_path + "bin/studio64.exe")
+        args = ctx.actions.args()
+        args.add_all(["--replace_resource", "_ANDROID_STUDIO_SYSTEM_SELECTOR_", system_selector])
+        _stamp_exe(ctx, args, [], studio_exe, stamped_studio_exe)
+
+        studio_bat, stamped_studio_bat = _declare_stamped_file(ctx, ret, platform, platform.base_path + "bin/studio.bat")
+        args = ctx.actions.args()
+        args.add("--replace_selector", system_selector)
+        _stamp(ctx, args, [], studio_bat, stamped_studio_bat)
+
+        game_tools_bat, stamped_game_tools_bat = _declare_stamped_file(ctx, ret, platform, platform.base_path + "bin/game-tools.bat")
+        args = ctx.actions.args()
+        args.add("--replace_selector", system_selector)
+        _stamp(ctx, args, [], game_tools_bat, stamped_game_tools_bat)
+
+    product_info_json, stamped_product_info_json = _declare_stamped_file(ctx, ret, platform, platform.resource_path + "product-info.json")
+    args = ctx.actions.args()
+    args.add("--build_txt", stamped_build_txt)
+    args.add("--stamp_product_info")
+    args.add("--replace_selector", system_selector)
+
+    so_jars = ctx.attr.searchable_options[_SearchableOptionsInfo].so_jars if getattr(ctx.attr, "searchable_options", None) else {}
+    for p in added_plugins:
+        plugin_keys = platform.get(p[PluginInfo].plugin_files).keys()
+        if p[PluginInfo].plugin_id in so_jars:
+            plugin_keys.append("plugins/%s/lib/%s.so.jar" % (p[PluginInfo].directory, p[PluginInfo].directory))
+        args.add_all("--added_plugin", [p[PluginInfo].plugin_id] + plugin_keys)
+
+    args.use_param_file("@%s")
+    args.set_param_file_format("multiline")
+    _stamp(ctx, args, [ctx.info_file, stamped_build_txt], product_info_json, stamped_product_info_json)
+
+    return ret
+
+def _stamp_plugin(ctx, platform, platform_files, files, overwrite_plugin_version):
+    ret = {}
+    ret.update(files)
+    build_txt = platform_files[platform.resource_path + "build.txt"]
+
+    (micro, _) = _split_version(ctx.attr.version_micro_patch)
+    version_component = _form_studio_version_component(ctx.attr.platform[IntellijInfo], micro)
+
+    for rel, file in files.items():
+        if rel.endswith(".jar"):
+            flat = rel.replace("/", "_")
+            if len(flat) > 60:
+                flat = "%s_%s" % (hash(rel), rel.split("/")[-1])
+            stamped_jar = ctx.actions.declare_file(ctx.attr.name + ".plugin.%s.stamped." % platform.name + flat)
+            ret[rel] = stamped_jar
+
+            args = ctx.actions.args()
+            args.add("--build_txt", build_txt)
+            args.add("--info_file", ctx.info_file)
+            args.add("--version_component", version_component)
+            args.add("--entry", "META-INF/plugin.xml")
+            args.add("--optional_entry")
+            args.add("--replace_build_number")
+            if overwrite_plugin_version:
+                args.add("--overwrite_plugin_version")
+            _stamp(ctx, args, [build_txt, ctx.info_file], file, stamped_jar)
+
+    return ret
+
+def _get_external_attributes(all_files):
+    attrs = {}
+    # Source files permissions are lost in RBE. We must define exactly what permissions we want
+    # LnZipper uses default permision unless changed here.
+    # Default permission is -rw-r--r--
+
+    executables = [
+        "jbr/bin/*",
+        "jbr/lib/jexec",
+        "jbr/lib/jspawnhelper",
+        "Contents/jbr/Contents/Home/bin/*",
+        "Contents/jbr/Contents/Home/lib/jspawnhelper",
+        "plugins/Kotlin/kotlinc/bin/*",
+        "bin/clangd",
+        "plugins/android-ndk/resources/lldb/bin/*",
+        "plugins/android-ndk/resources/lldb/android/*/lldb-server",
+        "plugins/android/resources/simpleperf/*/simpleperf",
+        "plugins/android/resources/simpleperf/*/libsimpleperf_report.so",
+        "plugins/android/resources/simpleperf/*/libsimpleperf_report.dylib",
+        "plugins/android/resources/perfetto/*/perfetto",
+        "plugins/android/resources/perfetto/*/traced",
+        "plugins/android/resources/perfetto/*/traced_probes",
+        "plugins/android/resources/perfetto/*/libperfetto.so",
+        "plugins/android/resources/trace_processor_daemon/trace_processor_daemon",
+        "plugins/android/resources/traceconv/traceconv",
+        "plugins/android/resources/trace_processor_server/trace-processor",
+        "plugins/gemini/resources/llamacpp/llama-server",
+        "plugins/gemini/resources/llamacpp/libggml*",
+        "plugins/gemini/resources/llamacpp/libllama*",
+        "plugins/gemini/resources/llamacpp/libmtmd*",
+        "plugins/android/resources/native/libimage_converter.dylib",
+        "bin/format.sh",
+        "bin/fsnotifier",
+        "bin/game-tools.sh",
+        "bin/inspect.sh",
+        "bin/ltedit.sh",
+        "bin/profiler.sh",
+        "bin/restarter",
+        "bin/studio",
+        "bin/studio.sh",
+        "Contents/MacOS/studio",
+        "Contents/bin/printenv",
+        "lib/pty4j/darwin/pty4j-unix-spawn-helper",
+    ]
+    for zip_path in all_files:
+        if zip_path.endswith("Info.plist"):
+            attrs[zip_path] = "664"
+        else:
+            for exc in executables:
+                if endswith_glob(zip_path, exc):
+                    attrs[zip_path] = "755"
+                    break
+
+    return attrs
+
+def _android_studio_os(ctx, platform, added_plugins, out, lst_out):
+    files = []
+    all_files = {}
+
+    config = ctx.attr.configuration[_ConfigurationInfo]
+    platform_prefix = config.mac_app_name + ".app/" if platform in [MAC, MAC_ARM] else "android-studio/"
+
+    platform_files = platform.get(ctx.attr.platform[IntellijInfo].base)
+    platform_files = replace_app_icon(ctx, platform.name, platform_files, config.application_icon[AppIconInfo], branding = "android-studio")
+    plugin_files = platform.get(ctx.attr.platform[IntellijInfo].plugins)
+
+    if ctx.attr.jre:
+        jre_data = ctx.attr.jre[StudioDataInfo]
+        jre_files = [(jre_data.mappings[f], f) for f in platform.get(jre_data).to_list()]
+        all_files.update({platform_prefix + platform.base_path + platform.jre + k: v for k, v in jre_files})
+
+    # Stamp the platform and its plugins
+    platform_files = _stamp_platform(ctx, platform, platform_files, added_plugins)
+    all_files.update({platform_prefix + k: v for k, v in platform_files.items()})
+
+    # for plugin in platform_plugins:
+    built_plugin_dirs = [p[PluginInfo].directory for p in added_plugins]
+    for plugin_dir, this_plugin_files in plugin_files.items():
+        if plugin_dir in built_plugin_dirs:
+            continue
+        this_plugin_files = _stamp_plugin(ctx, platform, platform_files, this_plugin_files, overwrite_plugin_version = False)
+        all_files.update({platform_prefix + k: v for k, v in this_plugin_files.items()})
+
+    dev01 = ctx.actions.declare_file(ctx.attr.name + ".dev01." + platform.name)
+    ctx.actions.write(dev01, "")
+    files.append((platform.base_path + "license/dev01_license.txt", dev01))
+
+    suffix = "64" if platform == LINUX else ("64.exe" if platform == WIN else "")
+    vm_options_path = platform_prefix + platform.base_path + "bin/studio" + suffix + ".vmoptions"
+    platform_vm_options = {
+        LINUX: ctx.attr.vm_options_linux,
+        MAC: ctx.attr.vm_options_mac,
+        MAC_ARM: ctx.attr.vm_options_mac_arm,
+        WIN: ctx.attr.vm_options_win,
+    }[platform]
+    vm_options = ctx.attr.vm_options + platform_vm_options + config.vm_options
+    _append(ctx, platform, all_files, vm_options_path, vm_options)
+
+    platform_properties = {
+        LINUX: ctx.attr.properties_linux,
+        MAC: ctx.attr.properties_mac,
+        MAC_ARM: ctx.attr.properties_mac_arm,
+        WIN: ctx.attr.properties_win,
+    }[platform]
+    properties = ctx.attr.properties + platform_properties + config.properties
+    _append(ctx, platform, all_files, platform_prefix + platform.base_path + "bin/idea.properties", properties)
+
+    license_files = []
+    for p in ctx.attr.plugins:
+        this_plugin_files = dict(platform.get(p[PluginInfo].plugin_files))
+
+        # Pack searchable-options metadata.
+        so_jars = ctx.attr.searchable_options[_SearchableOptionsInfo].so_jars
+        if p[PluginInfo].plugin_id in so_jars:
+            this_plugin_files.update({"plugins/%s/lib/%s.so.jar" % (p[PluginInfo].directory, p[PluginInfo].directory): so_jars[p[PluginInfo].plugin_id]})
+
+        this_plugin_files = _stamp_plugin(ctx, platform, platform_files, this_plugin_files, p[PluginInfo].overwrite_plugin_version)
+
+        license_files.append(p[PluginInfo].license_files)
+        this_plugin_full_files = {platform_prefix + platform.base_path + k: v for k, v in this_plugin_files.items()}
+        all_files.update(this_plugin_full_files)
+
+    files += [(platform.base_path + "license/" + f.basename, f) for f in depset([], transitive = license_files).to_list()]
+
+    all_files.update({platform_prefix + k: v for k, v in files})
+
+    if platform == MAC or platform == MAC_ARM:
+        all_files.update({"_codesign/entitlements.xml": ctx.file.codesign_entitlements})
+
+    if platform == WIN or platform == LINUX:
+        _produce_manifest(ctx, platform, platform_files)
+
+    args = ctx.actions.args()
+    args.add_all(all_files.keys())
+    args.set_param_file_format("multiline")
+    ctx.actions.write(output = lst_out, content = args)
+
+    attrs = _get_external_attributes(all_files)
+    _lnzipper(ctx, out.basename, all_files.items(), out, attrs = attrs)
+    return all_files
+
+def _studio_runner(ctx, name, target_to_file, out):
+    files = []
+    expected = []
+    for target, src in target_to_file.items():
+        dst = ctx.actions.declare_file(name + "/" + target)
+        files.append(dst)
+        expected.append(target)
+        ctx.actions.run_shell(
+            inputs = [src],
+            outputs = [dst],
+            command = "cp -f \"$1\" \"$2\"",
+            arguments = [src.path, dst.path],
+            mnemonic = "CopyFile",
+            progress_message = "Copying files",
+            use_default_shell_env = True,
+        )
+
+    file_list = ctx.actions.declare_file(name + "/files.lst")
+    ctx.actions.write(file_list, "\n".join(expected))
+    files.append(file_list)
+
+    # Creating runfiles would work, but we have files with spaces, and to avoid having all the needed
+    # files as ouputs of the list, we set them as sources of the final script.
+    ctx.actions.run_shell(
+        inputs = [ctx.file._studio_launcher] + files,
+        outputs = [out],
+        command = "cp -f \"$1\" \"$2\"",
+        arguments = [ctx.file._studio_launcher.path, out.path],
+        mnemonic = "CopyFile",
+        progress_message = "Copying files",
+        use_default_shell_env = True,
+    )
+    return files
+
+platform_by_name = {platform.name: platform for platform in [LINUX, MAC, MAC_ARM, WIN]}
+
+def _android_studio_impl(ctx):
+    plugin_list = []
+    for p in ctx.attr.plugins:
+        id = p[PluginInfo].plugin_id
+        plugin_list.append(p[PluginInfo].directory + (": " + id if id else ""))
+    ctx.actions.write(ctx.outputs.plugins, "".join(["%s\n" % line for line in plugin_list]))
+
+    outputs = {
+        LINUX: ctx.outputs.linux,
+        MAC: ctx.outputs.mac,
+        MAC_ARM: ctx.outputs.mac_arm,
+        WIN: ctx.outputs.win,
+    }
+    lst_outputs = {
+        LINUX: ctx.outputs.linux_lst,
+        MAC: ctx.outputs.mac_lst,
+        MAC_ARM: ctx.outputs.mac_arm_lst,
+        WIN: ctx.outputs.win_lst,
+    }
+    all_files = {}
+    for (platform, output) in outputs.items():
+        base_files = platform.get(ctx.attr.platform[IntellijInfo].base)
+        if platform != WIN and not base_files:
+            ctx.actions.write(output, "")
+            ctx.actions.write(lst_outputs[platform], "")
+            all_files[platform] = {}
+        else:
+            all_files[platform] = _android_studio_os(ctx, platform, ctx.attr.plugins, output, lst_outputs[platform])
+
+    _produce_update_message_html(ctx)
+
+    host_platform = platform_by_name[ctx.attr.host_platform_name]
+    script = ctx.actions.declare_file("%s/%s.py" % (ctx.attr.name, ctx.attr.config_profile))
+    studio_files = _studio_runner(ctx, ctx.attr.name, all_files[host_platform], script)
+
+    # Leave everything that is not the main zips as implicit outputs
+    return [
+        DefaultInfo(
+            executable = script,
+            files = depset([script, ctx.outputs.manifest, ctx.outputs.update_message]),
+        ),
+        OutputGroupInfo(files = depset(studio_files)),
+    ]
+
+_android_studio = rule(
+    attrs = {
+        "host_platform_name": attr.string(),
+        "codesign_entitlements": attr.label(allow_single_file = True),
+        "compress": attr.bool(),
+        "essential_plugins": attr.string_list(),
+        "jre": attr.label(providers = [StudioDataInfo]),
+        "platform": attr.label(providers = [IntellijInfo]),
+        "plugins": attr.label_list(providers = [PluginInfo]),
+        "searchable_options": attr.label(providers = [_SearchableOptionsInfo]),
+        "vm_options": attr.string_list(),
+        "vm_options_linux": attr.string_list(),
+        "vm_options_mac": attr.string_list(),
+        "vm_options_mac_arm": attr.string_list(),
+        "vm_options_win": attr.string_list(),
+        "properties": attr.string_list(),
+        "properties_linux": attr.string_list(),
+        "properties_mac": attr.string_list(),
+        "properties_mac_arm": attr.string_list(),
+        "properties_win": attr.string_list(),
+        "selector": attr.string(mandatory = True),
+        "version_code_name": attr.string(),
+        "version_micro_patch": attr.string(),
+        "version_release_number": attr.int(),
+        "update_message_template": attr.label(allow_single_file = True),
+        "configuration": attr.label(providers = [_ConfigurationInfo]),
+        "config_profile": attr.string(),
+        "_singlejar": attr.label(
+            default = Label("@bazel_tools//tools/jdk:singlejar"),
+            cfg = "exec",
+            executable = True,
+        ),
+        "_stamper": attr.label(
+            default = Label("//tools/adt/idea/studio:stamper"),
+            cfg = "exec",
+            executable = True,
+        ),
+        "_generate_build_metadata": attr.label(
+            default = Label("//tools/adt/idea/studio:generate_build_metadata"),
+            cfg = "exec",
+            executable = True,
+        ),
+        "_zipper": attr.label(
+            default = Label("@bazel_tools//tools/zip:zipper"),
+            cfg = "exec",
+            executable = True,
+        ),
+        "_lnzipper": attr.label(
+            default = Label("//tools/base/bazel/lnzipper:lnzipper"),
+            cfg = "exec",
+            executable = True,
+        ),
+        "_expander": attr.label(
+            default = Label("//tools/base/bazel/expander"),
+            cfg = "exec",
+            executable = True,
+        ),
+        "_patch_exe": attr.label(
+            default = Label("//tools/vendor/google/windows-exe-patcher:modify-exe"),
+            cfg = "exec",
+            executable = True,
+        ),
+        "_update_resources_jar": attr.label(
+            default = Label("//tools/adt/idea/studio/rules:modify_resources_jar"),
+            cfg = "exec",
+            executable = True,
+        ),
+        "_studio_launcher": attr.label(
+            allow_single_file = True,
+            default = Label("//tools/adt/idea/studio:studio.py"),
+        ),
+    },
+    outputs = {
+        "linux": "%{name}.linux.zip",
+        "mac": "%{name}.mac.zip",
+        "mac_arm": "%{name}.mac_arm.zip",
+        "win": "%{name}.win.zip",
+        "linux_lst": "%{name}.linux.lst",
+        "mac_lst": "%{name}.mac.lst",
+        "mac_arm_lst": "%{name}.mac_arm.lst",
+        "win_lst": "%{name}.win.lst",
+        "plugins": "%{name}.plugin.lst",
+        "manifest": "%{name}_build_manifest.textproto",
+        "update_message": "%{name}_update_message.html",
+    },
+    executable = True,
+    implementation = _android_studio_impl,
+)
+
+# Builds a distribution of android studio.
+# Args:
+#       platform: A studio_data target with the per-platform filegroups
+#       generate_package_metadata: If true, a write_package_metadata target will
+#                                  be created.
+#       jre: If include a target with the jre to bundle in.
+#       plugins: A list of plugins to be bundled
+#       modules: A dictionary (see studio_plugin) with modules bundled at top level
+#       resources: A dictionary (see studio_plugin) with resources bundled at top level
+#       update_message_template: A file to use for the update message. The following
+#                                substitutions are available to message templates:
+#                                 {full_version} - See _form_version_full below.
+#                                 {channel} - The channel derived from version_type.
+#       searchable_options_metadata: (Optional) A dictionary mapping configuration names to a dictionary
+#                                    mapping searchable options files to plugin ID, use this if adding
+#                                    a new plugin not in searchable_options_deps passed.
+#       searchable_options_deps: (Optional) A dictionary mapping configuration names to targets providing
+#                                _SearchableOptionsInfo.
+#       searchable_options_plugin_lst: (Optional) A list of plugin IDs to compute searchable options for.
+#
+# Regarding versioning information:
+# - The "version_*" parameters (like "version_micro_path" and
+#   "version_type") are used both for Android Studio itself and for
+#   metadata produced by this rule (e.g. the build manifest and the
+#   update message).
+# - The full version string is produced by "_form_version_full"
+#   following these rules:
+#   - If the version_type is "Stable", then the first release will not
+#     have a patch number, then every subsequent release will have a
+#     patch number starting at 1. In addition, the word "Stable" will
+#     never appear in the full version string.
+#   - If the version_type is anything other than "Stable", then the
+#     version_type will appear in the full version string, and
+#     version_release_number will be appended directly after.
+# Examples:
+# - Input: version_type = "Stable", version_release_number = 1
+# - Output: "Dolphin | 2022.1.1"
+# - Input: version_type = "Stable", version_release_number = 2
+# - Output: "Dolphin | 2022.1.1 Patch 1"
+# - Input: version_type = "Stable", version_release_number = 3
+# - Output: "Dolphin | 2022.1.1 Patch 2"
+# - Input: version_type = "Canary", version_release_number = 1
+# - Output: "Dolphin | 2022.1.1 Canary 1"
+# - Input: version_type = "Canary", version_release_number = 2
+# - Output: "Dolphin | 2022.1.1 Canary 2"
+# - Input: version_type = "RC", version_release_number = 3
+# - Output: "Dolphin | 2022.1.1 RC 3"
+#
+# version_release_number may or may not match the actual patch number.
+# For example, we may be on patch 12 of a Beta while still calling it
+# "Beta 3", meaning we've shipped 9 Canary releases and 2 Beta releases
+# before patch 12. In such a case, the release_number would be 3.
+def android_studio(
+        name,
+        plugins,
+        configurations,
+        searchable_options_metadata = {},
+        searchable_options_deps = {},
+        searchable_options_plugin_lst = [],
+        legacy_default_configuration = None,
+        generate_package_metadata = False,
+        **kwargs):
+    if generate_package_metadata:
+        write_package_metadata(
+            name = name + "-metadata",
+            deps = plugins,
+        )
+
+    configured_targets = {}
+    default_configuration = None
+    for configuration in configurations:
+        config_name = Label(configuration).name
+        configured_targets["." + config_name] = configuration
+        if legacy_default_configuration and config_name == legacy_default_configuration:
+            configured_targets[""] = configuration
+            default_configuration = configuration
+
+        # create searchable_options targets for each configuration
+        searchable_options(
+            name = "%s.%s.searchable-options" % (name, config_name),
+            files = searchable_options_metadata[config_name] if config_name in searchable_options_metadata else {},
+            deps = searchable_options_deps[config_name] if config_name in searchable_options_deps else [],
+            visibility = ["//visibility:public"],
+        )
+
+        # create searchable_options_test target for studio, that check searchable_options of each configuration
+        py_test(
+            name = "%s.%s.searchable_options_test" % (name, config_name),
+            srcs = [
+                "//tools/adt/idea/studio:searchable-options/searchable_options_test.py",
+                "//tools/adt/idea/studio:searchable-options/update_searchable_options.py",
+            ],
+            args = [
+                "--ide %s/%s.%s" % (native.package_name(), name, config_name),
+            ] + (["--plugins %s" % " ".join([Label(plugin).name for plugin in searchable_options_plugin_lst])] if searchable_options_plugin_lst else []),
+            data = [
+                ":%s.%s.plugin.lst" % (name, config_name),
+            ] + select({
+                "@platforms//os:linux": [":%s.%s.linux.zip" % (name, config_name)],
+                "//tools/base/bazel/platforms:macos-x86_64": [":%s.%s.mac.zip" % (name, config_name)],
+                "//tools/base/bazel/platforms:macos-arm64": [":%s.%s.mac_arm.zip" % (name, config_name)],
+            }),
+            imports = ["%s/tools/adt/idea/studio/searchable-options" % ("/".join([".."] * len(native.package_name().split("/"))) if native.package_name() else ".")],
+            main = "searchable_options_test.py",
+            tags = [
+                "block_network",
+                "noci:studio-win",
+            ],
+            target_compatible_with = select({
+                "@platforms//os:windows": ["@platforms//:incompatible"],
+                "//conditions:default": [],
+            }),
+        )
+
+        py_test(
+            name = "%s.%s.test_studio_files" % (name, config_name),
+            srcs = ["//tools/adt/idea/studio:tests/test_studio_files.py"],
+            data = native.glob([
+                "tests/expected_studio_files/%s/expected_linux.txt" % name,
+                "tests/expected_studio_files/%s/expected_mac.txt" % name,
+                "tests/expected_studio_files/%s/expected_mac_arm.txt" % name,
+                "tests/expected_studio_files/%s/expected_win.txt" % name,
+                "tests/expected_studio_files/%s/%s/expected_diff_linux.txt" % (name, config_name),
+                "tests/expected_studio_files/%s/%s/expected_diff_mac.txt" % (name, config_name),
+                "tests/expected_studio_files/%s/%s/expected_diff_mac_arm.txt" % (name, config_name),
+                "tests/expected_studio_files/%s/%s/expected_diff_win.txt" % (name, config_name),
+            ]) + [
+                ":%s.%s.linux.lst" % (name, config_name),
+                ":%s.%s.mac.lst" % (name, config_name),
+                ":%s.%s.mac_arm.lst" % (name, config_name),
+                ":%s.%s.win.lst" % (name, config_name),
+            ],
+            env = {
+                "ide": "%s/%s" % (native.package_name(), name),
+                "configuration": "%s" % config_name,
+            },
+            main = "test_studio_files.py",
+            tags = [
+                "noci:studio-win",  # b/234018495
+            ],
+        )
+
+    # create update_searchable_options target for studio, that generates searchable_options for each configuration
+    py_binary(
+        name = "%s.update_searchable_options" % name,
+        srcs = ["//tools/adt/idea/studio:searchable-options/update_searchable_options.py"],
+        args = [
+            "--out %s/searchable-options/%s" % (native.package_name(), name),
+            "--ide %s/%s" % (native.package_name(), name),
+            "--ide-configuration " + " ".join([Label(configuration).name for configuration in configurations]),
+        ] + (["--plugins %s" % " ".join([Label(plugin).name for plugin in searchable_options_plugin_lst])] if searchable_options_plugin_lst else []),
+        data = [
+            ":%s.%s.plugin.lst" % (name, Label(config).name)
+            for config in configurations
+        ] + select({
+            "@platforms//os:linux": [":%s.%s.linux.zip" % (name, Label(config).name) for config in configurations],
+            "//tools/base/bazel/platforms:macos-x86_64": [":%s.%s.mac.zip" % (name, Label(config).name) for config in configurations],
+            "//tools/base/bazel/platforms:macos-arm64": [":%s.%s.mac_arm.zip" % (name, Label(config).name) for config in configurations],
+        }),
+        main = "update_searchable_options.py",
+        tags = [
+            "block_network",
+            "noci:studio-win",
+        ],
+        target_compatible_with = select({
+            "@platforms//os:windows": ["@platforms//:incompatible"],
+            "//conditions:default": [],
+        }),
+    )
+
+    py_binary(
+        name = "%s.update_expected_studio_files" % name,
+        srcs = ["//tools/adt/idea/studio:tests/update_expected_studio_files.py"],
+        args = [
+            "--ide %s/%s" % (native.package_name(), name),
+            "--ide-configuration " + " ".join([Label(configuration).name for configuration in configurations]),
+        ],
+        data = [
+            file % (name, Label(configuration).name)
+            for configuration in configurations
+            for file in (
+                ":%s.%s.linux.lst",
+                ":%s.%s.mac.lst",
+                ":%s.%s.mac_arm.lst",
+                ":%s.%s.win.lst",
+            )
+        ],
+        main = "update_expected_studio_files.py",
+        tags = [
+            "block_network",
+            "noci:studio-win",
+        ],
+    )
+
+    for suffix, configuration in configured_targets.items():
+        _android_studio(
+            name = name + suffix,
+            compress = is_release(),
+            configuration = configuration,
+            config_profile = name,
+            host_platform_name = select({
+                "@platforms//os:linux": LINUX.name,
+                "//tools/base/bazel/platforms:macos-x86_64": MAC.name,
+                "//tools/base/bazel/platforms:macos-arm64": MAC_ARM.name,
+                "@platforms//os:windows": WIN.name,
+                "//conditions:default": "",
+            }),
+            plugins = plugins,
+            searchable_options = ":%s.%s.searchable-options" % (name, Label(configuration).name),
+            **kwargs
+        )
+        native.filegroup(
+            name = name + suffix + "_files",
+            srcs = [":" + name + suffix],
+            output_group = "files",
+            visibility = ["//visibility:public"],
+        )
+
+def _android_studio_configuration_impl(ctx):
+    return [_ConfigurationInfo(
+        application_icon = ctx.attr.application_icon,
+        version_type = ctx.attr.version_type,
+        version_suffix = ctx.attr.version_suffix,
+        mac_app_name = ctx.attr.mac_app_name,
+        vm_options = ctx.attr.vm_options,
+        properties = ctx.attr.properties,
+    )]
+
+def android_studio_configuration(
+        name,
+        flag_level,
+        enable_debug_flags = False,
+        vm_options = [],
+        properties = [],
+        **kwargs):
+    _vm_options = vm_options + [
+        "-Dflags.configuration.level=" + flag_level,
+        "-Dflags.debug.enabled=" + ("true" if enable_debug_flags else "false"),
+    ]
+    _android_studio_configuration(
+        name = name,
+        vm_options = _vm_options,
+        properties = properties,
+        **kwargs
+    )
+
+_android_studio_configuration = rule(
+    attrs = {
+        "application_icon": attr.label(providers = [AppIconInfo], mandatory = True),
+        "version_type": attr.string(),
+        "version_suffix": attr.string(),
+        "mac_app_name": attr.string(mandatory = True),
+        "vm_options": attr.string_list(),
+        "properties": attr.string_list(),
+    },
+    implementation = _android_studio_configuration_impl,
+)
+
+def _intellij_plugin_import_impl(ctx):
+    files = {}
+    plugin_dir = "plugins/" + ctx.attr.target_dir
+    id = ctx.attr.id or ctx.attr.name
+
+    # Note: platform plugins will have no files because they are already in intellij-sdk.
+    if ctx.attr.files:
+        for f in ctx.files.files:
+            if not f.short_path.startswith(ctx.attr.strip_prefix):
+                fail("File " + f.short_path + " does not start with prefix " + ctx.attr.strip_prefix)
+            relpath = f.short_path[len(ctx.attr.strip_prefix):]
+            files[plugin_dir + "/" + relpath] = f
+
+    plugin_jars = []
+
+    plugin_files_linux = _studio_plugin_os(ctx, LINUX, plugin_jars, plugin_dir) | files
+    plugin_files_mac = _studio_plugin_os(ctx, MAC, plugin_jars, plugin_dir) | files
+    plugin_files_mac_arm = _studio_plugin_os(ctx, MAC_ARM, plugin_jars, plugin_dir) | files
+    plugin_files_win = _studio_plugin_os(ctx, WIN, plugin_jars, plugin_dir) | files
+
+    # buildifier: disable=native-java-common (@rules_java is not usable in this file yet)
+    # buildifier: disable=native-java-info (@rules_java is not usable in this file yet)
+    java_info = java_common.merge([export[JavaInfo] for export in ctx.attr.exports])
+    jars = java_info.runtime_output_jars
+
+    _check_plugin(ctx, ctx.outputs.plugin_metadata, jars, ctx.attr.kind, id, allow_bundled_updates = ctx.attr.allow_bundled_updates)
+
+    return [
+        java_info,
+        DefaultInfo(runfiles = ctx.runfiles(files = ctx.files.files)),
+        PluginInfo(
+            directory = ctx.attr.target_dir,
+            plugin_metadata = ctx.outputs.plugin_metadata,
+            plugin_id = id,
+            modules = depset(),
+            libs = depset(ctx.attr.exports),
+            license_files = depset(),
+            plugin_files = struct(
+                linux = plugin_files_linux,
+                mac = plugin_files_mac,
+                mac_arm = plugin_files_mac_arm,
+                win = plugin_files_win,
+            ),
+            overwrite_plugin_version = ctx.attr.overwrite_plugin_version,
+        ),
+        # Force 'chkplugin' to run by marking its output as a validation output.
+        # See https://bazel.build/extending/rules#validation_actions for details.
+        OutputGroupInfo(_validation = depset([ctx.outputs.plugin_metadata])),
+    ]
+
+_intellij_plugin_import = rule(
+    attrs = {
+        "kind": attr.string(default = "plugin", doc = "Pass 'module' if this is a plugin module inside a larger host plugin"),
+        "id": attr.string(doc = "the plugin id, if different from the target name"),
+        "allow_bundled_updates": attr.bool(doc = "whether to allow this plugin to be updated out-of-band", default = False),
+        # Note: platform plugins will have no files because they are already in intellij-sdk.
+        "files": attr.label_list(allow_files = True),
+        "strip_prefix": attr.string(),
+        "target_dir": attr.string(),
+        "resources": attr.label_list(allow_files = True),
+        "resources_dirs": attr.string_list(),
+        # buildifier: disable=native-java-info (@rules_java is not usable in this file yet)
+        "exports": attr.label_list(providers = [JavaInfo], mandatory = True),
+        "compress": attr.bool(),
+        "overwrite_plugin_version": attr.bool(),
+        "_check_plugin": attr.label(
+            default = Label("//tools/adt/idea/studio:check_plugin"),
+            cfg = "exec",
+            executable = True,
+        ),
+    },
+    outputs = {
+        "plugin_metadata": "%{name}.info",
+    },
+    implementation = _intellij_plugin_import_impl,
+)
+
+def intellij_plugin_import(name, target_dir, exports, files = [], strip_prefix = "", resources = {}, overwrite_plugin_version = False, **kwargs):
+    """This macro is for prebuilt IntelliJ plugins that are not already part of intellij-sdk."""
+    resources_dirs, resources_list = _dict_to_lists(resources)
+    _intellij_plugin_import(
+        name = name,
+        files = files,
+        strip_prefix = strip_prefix,
+        target_dir = target_dir,
+        resources = resources_list,
+        resources_dirs = resources_dirs,
+        exports = exports,
+        compress = is_release(),
+        overwrite_plugin_version = overwrite_plugin_version,
+        **kwargs
+    )
+
+CIDR_PLUGINS = [
+    "c",
+    "cidr-base",
+    "cidr-clangd",
+    "cidr-debugger",
+]
+
+def _intellij_platform_impl_os(ctx, platform, data, zip_out):
+    files = platform.get(data).to_list()
+    plugin_dir = "%splugins/" % platform.base_path
+    base = []
+    plugins = {}
+
+    for file in files:
+        if file not in data.mappings:
+            fail("file %s not found in mappings" % file.path)
+        rel = data.mappings[file]
+        if not rel.startswith(plugin_dir):
+            # This is not a plugin file
+            base.append((rel, file))
+            continue
+        parts = rel[len(plugin_dir):].split("/")
+        if len(parts) == 0:
+            fail("Unexpected plugin file: " + rel)
+        plugin = parts[0]
+        is_cidr = plugin in CIDR_PLUGINS
+
+        if not ctx.attr.include_cidr and is_cidr:
+            continue
+        if plugin not in plugins:
+            plugins[plugin] = []
+        plugins[plugin].append((rel, file))
+
+    _zipper(ctx, "base %s platform zip" % platform.name, base, zip_out)
+
+    base_files = {rel: file for rel, file in base}
+    plugin_files = {plugin: {rel: file for rel, file in files} for plugin, files in plugins.items()}
+    return base_files, plugin_files
+
+def _intellij_platform_impl(ctx):
+    studio_data = ctx.attr.studio_data[StudioDataInfo]
+    base_files_linux, plugin_files_linux = _intellij_platform_impl_os(ctx, LINUX, studio_data, ctx.outputs.linux_zip)
+    base_files_win, plugin_files_win = _intellij_platform_impl_os(ctx, WIN, studio_data, ctx.outputs.win_zip)
+    base_files_mac, plugin_files_mac = _intellij_platform_impl_os(ctx, MAC, studio_data, ctx.outputs.mac_zip)
+    base_files_mac_arm, plugin_files_mac_arm = _intellij_platform_impl_os(ctx, MAC_ARM, studio_data, ctx.outputs.mac_arm_zip)
+
+    runfiles = ctx.runfiles(files = ctx.files.data)
+    return [
+        DefaultInfo(runfiles = runfiles),
+        # buildifier: disable=native-java-common (@rules_java is not usable in this file yet)
+        # buildifier: disable=native-java-info (@rules_java is not usable in this file yet)
+        java_common.merge([export[JavaInfo] for export in ctx.attr.exports]),
+        IntellijInfo(
+            major_version = ctx.attr.major_version,
+            minor_version = ctx.attr.minor_version,
+            base = struct(
+                linux = base_files_linux,
+                mac = base_files_mac,
+                mac_arm = base_files_mac_arm,
+                win = base_files_win,
+            ),
+            plugins = struct(
+                linux = plugin_files_linux,
+                mac = plugin_files_mac,
+                mac_arm = plugin_files_mac_arm,
+                win = plugin_files_win,
+            ),
+        ),
+    ]
+
+_intellij_platform = rule(
+    attrs = {
+        "major_version": attr.string(),
+        "minor_version": attr.string(),
+        # buildifier: disable=native-java-info (@rules_java is not usable in this file yet)
+        "exports": attr.label_list(providers = [JavaInfo]),
+        "data": attr.label_list(allow_files = True),
+        "studio_data": attr.label(providers = [StudioDataInfo]),
+        "compress": attr.bool(),
+        "include_cidr": attr.bool(default = True),
+        "_zipper": attr.label(
+            default = Label("@bazel_tools//tools/zip:zipper"),
+            cfg = "exec",
+            executable = True,
+        ),
+    },
+    outputs = {
+        "linux_zip": "%{name}.linux.zip",
+        "win_zip": "%{name}.win.zip",
+        "mac_zip": "%{name}.mac.zip",
+        "mac_arm_zip": "%{name}.mac_arm.zip",
+    },
+    # buildifier: disable=native-java-info (@rules_java is not usable in this file yet)
+    provides = [DefaultInfo, JavaInfo, IntellijInfo],
+    implementation = _intellij_platform_impl,
+)
+
+def intellij_platform_import(name, spec):
+    """Imports a platform used only for building standalone plugins.
+
+    Args:
+      name: the platform name
+      spec: a map of bundled plugins and associated jars
+    """
+    _intellij_platform(
+        name = name,
+        major_version = getattr(spec, "major_version", "2026"),
+        minor_version = getattr(spec, "minor_version", "2"),
+        exports = [":" + name + "_jars"],
+        studio_data = name + ".data",
+        visibility = ["//visibility:public"],
+    )
+
+    jvm_import(
+        name = name + "_jars",
+        jars = [jar[1:] for jar in spec.jars + spec.jars_linux],
+        visibility = ["//visibility:public"],
+    )
+
+    prebuilts_dir = native.package_name()
+    platform_files = native.glob(
+        include = [
+            "bin/**",
+            "lib/**",
+            "license/**",
+            "plugins/**",
+            "build.txt",
+            "product-info.json",
+            "LICENSE.txt",
+            "NOTICE.txt",
+        ],
+        exclude = [
+            "plugins/textmate/lib/bundles/**",
+        ],
+    )
+
+    studio_data(
+        name = name + ".data",
+        files_win = platform_files,
+        mappings = {
+            "%s/" % prebuilts_dir: "",
+        },
+    )
+
+    native.filegroup(
+        name = name + "-product-info",
+        srcs = ["product-info.json"],
+        visibility = ["//visibility:public"],
+    )
+
+    native.filegroup(
+        name = name + "-build-txt",
+        srcs = ["build.txt"],
+        visibility = ["//visibility:public"],
+    )
+
+    dir_archive(
+        name = name + "-dist",
+        dir = "",
+        dir_relative_to_repository = True,
+        compress = True,  # Workaround for b/467773803: IntelliJ 2025.3 is too large for zipper output.
+        files = native.glob(
+            include = ["**"],
+            exclude = ["spec.bzl", "BUILD.bazel", "WORKSPACE"],
+        ),
+        visibility = ["//visibility:public"],
+    )
+
+    for plugin, jars in spec.plugin_jars.items():
+        # 'kind' indicates whether this is a top-level plugin, or a plugin module inside a host plugin.
+        kind = "module" if len(jars) == 1 and ("/modules/" in jars[0] or jars[0].startswith("lib/")) else "plugin"
+        jars_target_name = "%s-plugin-%s-jars" % (name, plugin)
+        jvm_import(
+            name = jars_target_name,
+            jars = jars,
+            visibility = ["//visibility:public"],
+        )
+        intellij_plugin_import(
+            name = name + "-plugin-%s" % plugin,
+            id = plugin,
+            kind = kind,
+            allow_bundled_updates = True,  # Since these plugins are outside our control.
+            exports = [":" + jars_target_name],
+            target_dir = "",
+            visibility = ["//visibility:public"],
+        )
+
+    jvm_import(
+        name = name + "-test-framework",
+        jars = ["lib/testFramework.jar"],
+        visibility = ["//visibility:public"],
+    )
+
+def intellij_platform(
+        name,
+        src,
+        spec,
+        vmoptions_prefix,
+        sdk_dir_name):
+    """Declares an IntelliJ Platform to be used in building a full IDE distribution.
+
+    Args:
+      name: the platform name
+      src: the root directory
+      spec: a map of bundled plugins and associated jars
+      vmoptions_prefix: a name that is used as the prefix of the vmoptions file
+      sdk_dir_name: the name of the directory to enter to reach platform root
+    """
+    sdk_dirs = struct(
+        windows = src + "/windows/" + sdk_dir_name,
+        darwin = src + "/darwin/" + sdk_dir_name,
+        darwin_aarch64 = src + "/darwin_aarch64/" + sdk_dir_name,
+        linux = src + "/linux/" + sdk_dir_name,
+    )
+
+    prebuilt_package_metadata(
+        name = name + "_prebuilt_metadata",
+        third_party_dependencies = sdk_dirs.linux + "/license/third-party-libraries.json",
+    )
+
+    jvm_import(
+        name = name + "_jars",
+        jars = select({
+            "@platforms//os:windows": [sdk_dirs.windows + jar for jar in spec.jars + spec.jars_windows],
+            "//tools/base/bazel/platforms:macos-x86_64": [sdk_dirs.darwin + "/Contents" + jar for jar in spec.jars + spec.jars_darwin],
+            "//tools/base/bazel/platforms:macos-arm64": [sdk_dirs.darwin_aarch64 + "/Contents" + jar for jar in spec.jars + spec.jars_darwin_aarch64],
+            "//conditions:default": [sdk_dirs.linux + jar for jar in spec.jars + spec.jars_linux],
+        }),
+        srcjar = src + "/android-studio-sources.zip",
+        add_exports = spec.add_exports,
+        add_opens = spec.add_opens,
+    )
+
+    _intellij_platform(
+        name = name,
+        major_version = spec.major_version,
+        minor_version = spec.minor_version,
+        exports = [":" + name + "_jars"],
+        compress = is_release(),
+        include_cidr = select({
+            "//tools/vendor/google/alt-lang/lsp4ij/as-plugin:enabled-setting": False,
+            "//conditions:default": True,
+        }),
+        package_metadata = [
+            ":" + name + "_prebuilt_metadata",
+        ],
+        studio_data = name + ".data",
+        visibility = [
+            "@intellij//:__subpackages__",
+            "//tools/adt/idea/as-driver:__pkg__",
+        ],
+        # Local linux sandbox does not support spaces in names, so we exclude some files
+        # Otherwise we get: "link or target filename contains space"
+        data = select({
+            "@platforms//os:windows": native.glob(
+                include = [sdk_dirs.windows + "/**"],
+                exclude = [sdk_dirs.windows + "/plugins/textmate/lib/bundles/**"],
+            ),
+            "//tools/base/bazel/platforms:macos-x86_64": native.glob(
+                include = [sdk_dirs.darwin + "/**"],
+                exclude = [sdk_dirs.darwin + "/Contents/plugins/textmate/lib/bundles/**"],
+            ),
+            "//tools/base/bazel/platforms:macos-arm64": native.glob(
+                include = [sdk_dirs.darwin_aarch64 + "/**"],
+                exclude = [sdk_dirs.darwin_aarch64 + "/Contents/plugins/textmate/lib/bundles/**"],
+            ),
+            "//conditions:default": native.glob(
+                include = [sdk_dirs.linux + "/**"],
+                exclude = [sdk_dirs.linux + "/plugins/textmate/lib/bundles/**"],
+            ),
+        }),
+    )
+
+    ide_paths = {
+        "darwin": sdk_dirs.darwin,
+        "darwin_aarch64": sdk_dirs.darwin_aarch64,
+        "linux": sdk_dirs.linux,
+        "windows": sdk_dirs.windows,
+    }
+
+    # buildifier: disable=native-py
+    native.py_test(
+        name = name + "_spec_test",
+        srcs = ["//tools/adt/idea/studio:intellij_test.py"],
+        main = "intellij_test.py",
+        tags = ["noci:studio-win"],
+        data = native.glob([
+            src + "/**/lib/*.jar",
+            src + "/**/lib/modules/*.jar",
+            "**/product-info.json",
+        ]),
+        env = {
+            "spec": json.encode(spec),
+            "intellij_paths": ",".join([k + "=" + native.package_name() + "/" + v for k, v in ide_paths.items()]),
+        },
+        deps = ["//tools/adt/idea/studio:intellij"],
+    )
+
+    # Expose lib/resources.jar as a separate target
+    # buildifier: disable=native-java-import (@rules_java is not usable in this file yet)
+    native.java_import(
+        name = name + "-resources-jar",
+        jars = select({
+            "@platforms//os:windows": native.glob([sdk_dirs.windows + "/lib/resources.jar"]),
+            "//tools/base/bazel/platforms:macos-x86_64": native.glob([sdk_dirs.darwin + "/Contents/lib/resources.jar"]),
+            "//tools/base/bazel/platforms:macos-arm64": native.glob([sdk_dirs.darwin_aarch64 + "/Contents/lib/resources.jar"]),
+            "//conditions:default": native.glob([sdk_dirs.linux + "/lib/resources.jar"]),
+        }),
+        visibility = ["@intellij//:__subpackages__"],
+    )
+
+    # Expose build.txt from the prebuilt SDK
+    native.filegroup(
+        name = name + "-build-txt",
+        srcs = select({
+            "@platforms//os:windows": [sdk_dirs.windows + "/build.txt"],
+            "//tools/base/bazel/platforms:macos-x86_64": [sdk_dirs.darwin + "/Contents/Resources/build.txt"],
+            "//tools/base/bazel/platforms:macos-arm64": [sdk_dirs.darwin_aarch64 + "/Contents/Resources/build.txt"],
+            "//conditions:default": [sdk_dirs.linux + "/build.txt"],
+        }),
+        visibility = ["@intellij//:__subpackages__"],
+    )
+
+    # Expose product-info.json.
+    native.filegroup(
+        name = name + "-product-info",
+        srcs = select({
+            "@platforms//os:windows": [sdk_dirs.windows + "/product-info.json"],
+            "//tools/base/bazel/platforms:macos-x86_64": [sdk_dirs.darwin + "/Contents/Resources/product-info.json"],
+            "//tools/base/bazel/platforms:macos-arm64": [sdk_dirs.darwin_aarch64 + "/Contents/Resources/product-info.json"],
+            "//conditions:default": [sdk_dirs.linux + "/product-info.json"],
+        }),
+        visibility = ["@intellij//:__subpackages__"],
+    )
+
+    # Expose the default VM options file.
+    native.filegroup(
+        name = name + "-vm-options",
+        srcs = select({
+            "@platforms//os:windows": [sdk_dirs.windows + "/bin/" + vmoptions_prefix + "64.exe.vmoptions"],
+            "//tools/base/bazel/platforms:macos-x86_64": [sdk_dirs.darwin + "/Contents/bin/" + vmoptions_prefix + ".vmoptions"],
+            "//tools/base/bazel/platforms:macos-arm64": [sdk_dirs.darwin_aarch64 + "/Contents/bin/" + vmoptions_prefix + ".vmoptions"],
+            "//conditions:default": [sdk_dirs.linux + "/bin/" + vmoptions_prefix + "64.vmoptions"],
+        }),
+        visibility = ["@intellij//:__subpackages__"],
+    )
+
+    # This gives the path to the intellij_platform rule from root. e.g., "prebuilts/studio/intellij-sdk"
+    prebuilts_dir = native.package_name()
+    dir_archive(
+        name = name + "-full-linux",
+        dir = prebuilts_dir + "/" + src + "/linux",
+        files = native.glob([sdk_dirs.linux + "/**"]),
+        visibility = ["//tools/vendor/google/aswb/third_party/java/jetbrains/protobuf:__pkg__"],
+    )
+
+    studio_data(
+        name = name + ".data",
+        files_linux = native.glob([src + "/linux/**"]),
+        files_mac = native.glob([src + "/darwin/**"]),
+        files_mac_arm = native.glob([src + "/darwin_aarch64/**"]),
+        files_win = native.glob([src + "/windows/**"]),
+        mappings = {
+            "%s/%s/" % (prebuilts_dir, sdk_dirs.linux): "",
+            "%s/%s/" % (prebuilts_dir, sdk_dirs.darwin): "",
+            "%s/%s/" % (prebuilts_dir, sdk_dirs.darwin_aarch64): "",
+            "%s/%s/" % (prebuilts_dir, sdk_dirs.windows): "",
+        },
+    )
+
+    for plugin, jars in spec.plugin_jars.items():
+        # Note: some "plugins" are actually v2 submodules (existing inside a larger plugin
+        # or inside the platform). See go/studio-v2-modules for details.
+        is_v2_module = len(jars) == 1 and ("/modules/" in jars[0] or jars[0].startswith("lib/"))
+        kind = "module" if is_v2_module else "plugin"
+        jars_target_name = "%s-plugin-%s_jars" % (name, plugin)
+        _gen_plugin_jars_import_target(jars_target_name, spec, sdk_dirs, plugin, jars, srcjar = src + "/android-studio-sources.zip")
+        _intellij_plugin_import(
+            name = name + "-plugin-%s" % plugin,
+            id = plugin,
+            kind = kind,
+            exports = [":" + jars_target_name],
+            visibility = ["@intellij//:__subpackages__"],
+        )
+
+    jvm_import(
+        name = name + "-updater",
+        jars = native.glob([src + "/updater-full.jar"]),
+        visibility = ["@intellij//:__subpackages__"],
+    )
+
+    # Expose the IntelliJ test framework separately, for consumption by tests only.
+    jvm_import(
+        name = name + "-test-framework",
+        jars = select({
+            "@platforms//os:windows": [sdk_dirs.windows + "/lib/testFramework.jar"],
+            "//tools/base/bazel/platforms:macos-x86_64": [sdk_dirs.darwin + "/Contents/lib/testFramework.jar"],
+            "//tools/base/bazel/platforms:macos-arm64": [sdk_dirs.darwin_aarch64 + "/Contents/lib/testFramework.jar"],
+            "//conditions:default": [sdk_dirs.linux + "/lib/testFramework.jar"],
+        }),
+        srcjar = src + "/android-studio-sources.zip",
+        visibility = ["@intellij//:__subpackages__"],
+    )
+
+def _gen_plugin_jars_import_target(name, spec, sdk_dirs, plugin, jars, srcjar):
+    """Generates a jvm_import target for the specified plugin."""
+    add_windows = spec.plugin_jars_windows[plugin] if plugin in spec.plugin_jars_windows else []
+    jars_windows = [sdk_dirs.windows + "/" + jar for jar in jars + add_windows]
+    add_darwin = spec.plugin_jars_darwin[plugin] if plugin in spec.plugin_jars_darwin else []
+    jars_darwin = [sdk_dirs.darwin + "/Contents/" + jar for jar in jars + add_darwin]
+    add_darwin_aarch64 = spec.plugin_jars_darwin_aarch64[plugin] if plugin in spec.plugin_jars_darwin_aarch64 else []
+    jars_darwin_aarch64 = [sdk_dirs.darwin_aarch64 + "/Contents/" + jar for jar in jars + add_darwin_aarch64]
+    add_linux = spec.plugin_jars_linux[plugin] if plugin in spec.plugin_jars_linux else []
+    jars_linux = [sdk_dirs.linux + "/" + jar for jar in jars + add_linux]
+
+    jvm_import(
+        name = name,
+        jars = select({
+            "@platforms//os:windows": jars_windows,
+            "//tools/base/bazel/platforms:macos-x86_64": jars_darwin,
+            "//tools/base/bazel/platforms:macos-arm64": jars_darwin_aarch64,
+            "//conditions:default": jars_linux,
+        }),
+        srcjar = srcjar,
+    )
+
+def _studio_project_model_generator_impl(ctx):
+    out_dir = ctx.actions.declare_directory(ctx.attr.out_dir_name)
+    project_path = ctx.attr.project_path
+    manifest_path = ctx.attr.manifest_path
+    runfiles_path = ctx.executable.tool.path + ".runfiles"
+    tool_runfiles = ctx.attr.tool[DefaultInfo].default_runfiles.files
+    all_args = [out_dir.path, project_path, manifest_path] + ctx.attr.tool_args
+
+    ctx.actions.run(
+        outputs = [out_dir],
+        inputs = depset(ctx.files.srcs, transitive = [tool_runfiles]),
+        executable = ctx.executable.tool,
+        arguments = all_args,
+        env = {
+            "RUNFILES_DIR": runfiles_path,
+            "TEST_SRCDIR": runfiles_path,
+            "TEST_WORKSPACE": ctx.workspace_name,
+            "HOME": ".",
+            "USER_HOME": ".",
+            "JAVA_TOOL_OPTIONS": "-Djava.awt.headless=true",
+        },
+        mnemonic = "TargetGen",
+        progress_message = "Generating directory %s" % out_dir.path,
+    )
+    return [DefaultInfo(files = depset([out_dir]), runfiles = ctx.runfiles(files = [out_dir]))]
+
+studio_project_model_generator = rule(
+    implementation = _studio_project_model_generator_impl,
+    attrs = {
+        "srcs": attr.label_list(allow_files = True),
+        "tool": attr.label(executable = True, mandatory = True, cfg = "target"),
+        "out_dir_name": attr.string(mandatory = True),
+        "project_path": attr.string(mandatory = True),
+        "manifest_path": attr.string(mandatory = True),
+        "tool_args": attr.string_list(),
+    },
+)
+
+def studio_project_model(name, manifest_path, out_dir_name, project_path, srcs = [], visibility = None):
+    generator_name = name + "_generator"
+    java_binary(
+        name = generator_name,
+        testonly = True,
+        main_class = "com.android.tools.idea.ProjectIndexAndGradleSyncGenerator",
+        data = srcs,
+        runtime_deps = ["//tools/adt/idea/android/integration:project_model_generator_lib"],
+    )
+    studio_project_model_generator(
+        name = name,
+        srcs = srcs,
+        testonly = True,
+        manifest_path = manifest_path,
+        out_dir_name = out_dir_name,
+        project_path = project_path,
+        tool = ":" + generator_name,
+        visibility = visibility,
+    )
