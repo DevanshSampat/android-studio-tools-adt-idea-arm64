@@ -1011,6 +1011,9 @@ android_studio_configuration(
     mac_app_name = "Android Studio",
     version_suffix = None,
     version_type = STUDIO_VERSION,
+    vm_options = [
+        "-Dgradle.sync.control.enabled=true",
+    ],
 )
 
 STUDIO_CORE_PLUGINS = [
